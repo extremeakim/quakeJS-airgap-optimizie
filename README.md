@@ -1,148 +1,142 @@
-# QuakeJS — browser LAN, air-gap edition
+# QuakeJS — air-gapped LAN server
 
-Quake 3 Arena in the browser, full multiplayer, no internet. Same idea as the RA2
-setup next door: build the image on a box **with** internet, `docker save` it to a
-tarball, carry it to the air-gapped server, `docker load`, `docker compose up`.
+A Docker image that runs [QuakeJS](https://github.com/inolen/quakejs) (Quake 3
+Arena in the browser) as a self-contained LAN server on a machine with **no
+internet access**. Build it once on a connected machine, carry the image across
+as a tarball, load it on the isolated server, and every player joins from a
+browser. Nothing is fetched from the internet at runtime.
 
-Unlike RA2 (one container per player), QuakeJS runs one real dedicated server
-inside the image, so **everyone shares one container** and just points a browser at
-it.
+## Credits
 
-## Why a custom image (vs. the stock `treyyoder/quakejs`)
+- **Quake 3 Arena** — id Software.
+- **ioquake3** — the open-source engine QuakeJS is built on.
+- **QuakeJS** — [inolen/quakejs](https://github.com/inolen/quakejs), the
+  Emscripten port of ioquake3 to the browser.
+- **treyyoder/quakejs** — [github.com/treyyoder/quakejs](https://github.com/treyyoder/quakejs),
+  the Docker image this one is based on. It bundles the game assets, the Apache
+  web client, and the Node dedicated server into one container.
 
-The stock image bakes the game assets in, but breaks on an air-gapped box in two
-ways — both patched in `entrypoint.sh`:
+This repository only adds a thin layer on top of that image. All credit for the
+game, the port, and the packaging belongs to the projects above.
 
-1. **Dedicated server** launches with no `fs_cdn`, so it tries to download the
-   asset manifest from `content.quakejs.com` and the container dies. Fix: point
-   the server's `fs_cdn` at the local Apache (`127.0.0.1:80`), which already
-   serves every `.pk3` and the manifest.
-2. **Browser client** fetched its assets from a hardcoded host:port. If the page
-   is opened from any other origin (a different published port, an IP, a reverse
-   proxy) the asset XHR becomes cross-origin and the browser blocks it (no
-   `Access-Control-Allow-Origin`) — the game hangs on the first logo. Fix: the
-   client now fetches assets from `window.location.host` (the exact origin the
-   page loaded from → always same-origin), and Apache also sends a permissive
-   CORS header as insurance. Works behind any port mapping or proxy.
+## What this image changes
 
-The game server is a WebSocket on **:27960** — that port must be reachable from
-the player PCs too (not just the web port).
+The stock image assumes internet access and a fixed hostname. This image patches
+four things so it runs offline, from any address, and stays up unattended:
 
-## Build (on a box with internet)
+| Change | Where | Why |
+|--------|-------|-----|
+| Dedicated server reads assets from the local Apache (`fs_cdn 127.0.0.1:80`) | `entrypoint.sh` | Stock server fetches its manifest from `content.quakejs.com` and crashes offline |
+| Browser client loads assets and connects to the game server using the page's own origin | `entrypoint.sh` | Stock client hardcodes `quakejs:80` / `quakejs:27960`, which breaks with CORS behind any other IP, port, or proxy |
+| `TCP_NODELAY` forced on every game-server socket | `nodelay-patch.js` | Node leaves Nagle's algorithm on; with Quake's small packets this causes ping spikes and rubber-banding even on a LAN |
+| Watchdog + Docker `HEALTHCHECK` | `entrypoint.sh`, `healthcheck.js` | Docker only restarts on process exit; the Emscripten server can hang while still running. The watchdog turns a hang into an exit so the restart policy fires |
 
-```powershell
+Plus a tuned `server.cfg` (map rotation, tick rate, rates) baked in and
+bind-mountable, so maps and rules change without a rebuild.
+
+## Repository contents
+
+| File | Purpose |
+|------|---------|
+| `Dockerfile` | Builds on `treyyoder/quakejs`, adds the patches below |
+| `entrypoint.sh` | Patches the client page, starts Apache and the dedicated server, runs the watchdog |
+| `nodelay-patch.js` | Preloaded via `node --require`; sets `TCP_NODELAY` on incoming connections |
+| `healthcheck.js` | Opens a WebSocket to `:27960`; exit 0 if the server answers |
+| `server.cfg` | Server name, rules, map rotation, rcon password |
+| `docker-compose.yml` | Runs the container with ports, restart policy, and the `server.cfg` bind mount |
+
+## Build (on a machine with internet)
+
+Requires Docker.
+
+```bash
+git clone https://github.com/extremeakim/quakeJS-airgap-optimizie.git
+cd quakeJS-airgap-optimizie
 docker build -t quakejs-airgap:latest .
-docker save quakejs-airgap:latest | gzip > quakejs-airgap.tar.gz   # carry this across
+docker save quakejs-airgap:latest | gzip > quakejs-airgap.tar.gz
 ```
 
-## Run (on the air-gapped server)
+Copy `quakejs-airgap.tar.gz`, `docker-compose.yml`, and `server.cfg` to the
+air-gapped server. Keep `server.cfg` next to `docker-compose.yml`: the compose
+file bind-mounts it, and a bind mount of a missing file creates an empty one and
+the server loses its config.
+
+## Deploy (on the air-gapped server)
+
+Requires Docker and Docker Compose v2.
 
 ```bash
 docker load < quakejs-airgap.tar.gz
 docker compose up -d
 ```
 
+Check it is running:
+
+```bash
+docker ps            # STATUS should show "healthy" after ~45s
+docker logs quakejs  # look for "nodelay-patch: TCP_NODELAY enabled" once a player connects
+```
+
 ## Play
 
-Every player opens `http://<server-ip>:8080`. The web client auto-connects to the
-dedicated server baked into the same container (map rotation is in the image's
-`server.cfg`; starts on `q3dm1` with bots). Ports: **8080** = web client, **27960**
-= WebSocket game server — both must be reachable from the player PCs.
+Every player opens `http://<server-ip>:8080` in a browser. The client connects
+automatically to the dedicated server in the same container.
 
-> Note: browser (WebSocket) clients can only play against other browser clients,
-> not native Quake 3.
+Two ports must be reachable from the player PCs:
 
-## Persistence — what survives a restart (and what can't)
+| Port | Purpose |
+|------|---------|
+| 8080 | Web client (HTTP) |
+| 27960 | Game server (WebSocket) |
 
-**Quake 3 Arena has no save-game / progression system, and QuakeJS ships no
-database** (there are no db libraries in the image). It's a session-based arena
-shooter, so there's genuinely no "player progress" to store. Concretely:
+Browser clients can only play against other browser clients, not native Quake 3.
 
-| State | Where it lives | Survives container restart? |
-|-------|----------------|------------------------------|
-| Current match scores / frags / map timer | Server RAM | **No** — resets on any server restart, by design. Not fixable; there's nothing to persist it to. |
-| Server rules & map (hostname, gametype, rotation, rcon changes) | `server.cfg` | **Yes**, if you put them in `server.cfg` (mounted). Changes made *live* via rcon are RAM-only — write them into `server.cfg` to keep them. |
-| Player name, cvars, key binds, video settings | **Each player's browser** (IndexedDB), not the server | **Yes** — unaffected by container restarts. If a player loses these, it's their browser clearing site data, not the server. |
+## Configuration
 
-So the honest answer to "is there a local DB for active state": no, and there's
-nothing to point one at — the only durable server-side state is `server.cfg`,
-which you already control. (The emscripten server uses a virtual filesystem, so
-`fs_homepath` can't be redirected to a volume; don't try — it fails FS_Startup.)
+Edit `server.cfg` on the server, then `docker compose restart quakejs`. The file
+is commented; the main knobs are at the top.
 
-## Staying up: auto-restart on crash *or* hang
+- **Rcon password** — change `rconpassword` before use. The shipped value is a
+  placeholder.
+- **Maps** — only the maps baked into the base image can be loaded:
+  `q3dm1 q3dm7 q3dm9 q3dm17 q3tourney2 q3tourney6_ctf`. Other names fail to load.
+- **Game type** — `g_gametype` 0 = FFA, 1 = tournament, 3 = team DM, 4 = CTF
+  (CTF needs `q3tourney6_ctf`).
+- **Tick rate** — `sv_fps 20` is stock and gives the single-threaded server the
+  most headroom. Try 30 only if pings stay flat.
 
-`restart: unless-stopped` alone isn't enough: Docker only restarts a container
-when its main process **exits**, but the emscripten server can occasionally *hang*
-(process alive, game dead) — which is why it could "silently fail and never come
-back." This image adds:
+To change the map live without a restart, open the in-game console (`~`):
 
-- an internal **watchdog** (in `entrypoint.sh`) that probes the game server every
-  30s and, if it has died or stopped responding for ~60s, exits so the `restart`
-  policy recreates the container;
-- a Docker **HEALTHCHECK** so `docker ps` shows `healthy` / `unhealthy`.
+```
+\rconpassword <your rcon password>
+\rcon map q3dm17
+```
 
-Verified: killing the server process is detected within 30s and the container
-restarts itself back to `healthy`.
+## Operation notes
 
-## Changing the map / rules
+- **Restart policy** is `unless-stopped`: the container comes back after a
+  crash, a hang (via the watchdog), or a host reboot, but not after a manual
+  `docker compose stop`.
+- **No persistent server state.** Quake 3 has no save system; scores reset on
+  restart by design. Player names, binds, and video settings live in each
+  player's browser storage, not on the server. The only durable server-side
+  state is `server.cfg`.
+- **CPU.** The dedicated server is single-threaded. `docker-compose.yml` grants
+  it 2 CPUs; uncomment `cpuset` to pin it to specific cores if other containers
+  share the host and pings spike under load.
+- **Ping spikes after all this** almost always mean Wi-Fi or a lossy link. TCP
+  turns small packet loss into stalls; use wired connections.
 
-The server reads `server.cfg` (baked into the image with good defaults, and also
-bind-mounted from `./server.cfg` via `docker-compose.yml` so you can edit it on the
-server). **Carry `server.cfg` alongside `docker-compose.yml`** — the bind mount
-needs it.
+### Client-side tuning
 
-- **Persistent:** edit `server.cfg` (map rotation / fixed map / rules are all at
-  the top, with the full map list), then `docker compose restart quakejs`.
-- **Live, no restart:** open the in-game console (the `~` key) and use rcon:
-  ```
-  \rconpassword <your rcon password from server.cfg>
-  \rcon map q3dm17
-  ```
+In the in-game console (persists per browser):
 
-> If you carry `docker-compose.yml` but forget `server.cfg`, a Linux bind mount
-> will create an empty file and the server loses its config — so keep them
-> together. (You can also delete the `volumes:` block to just use the baked-in
-> defaults.)
+```
+\rate 25000
+\snaps 40
+\cl_maxpackets 60
+\cl_timenudge 0
+```
 
-## Performance
-
-### Ping spikes / rubber-banding / "teleporting" (20ms → 700ms)
-
-This is a **network-transport** problem, not FPS. QuakeJS talks to the server over
-WebSocket (TCP), and Quake sends many tiny packets per second. Node leaves TCP
-Nagle's algorithm on by default, which batches those packets and — with TCP
-delayed-ACK — causes sudden latency spikes even on a quiet LAN. That's the classic
-"ping normally 20, jumps to 700, everyone teleports."
-
-**Fixed in this image:** `nodelay-patch.js` (preloaded via `node --require` in
-`entrypoint.sh`) forces `TCP_NODELAY` on every game-server socket, disabling
-Nagle. You'll see `nodelay-patch: TCP_NODELAY enabled on game-server sockets` in
-`docker logs quakejs` the first time a player connects.
-
-If pings still spike after that, the remaining causes are, in order:
-
-- **WiFi / lossy links.** TCP turns a little packet loss into big stalls
-  (head-of-line blocking). Put players (and the server) on **wired** connections.
-- **Server frame hitches.** The dedicated server is a single-threaded emscripten
-  process; under load it can stall for a fraction of a second, spiking everyone's
-  ping at once. Give the container a dedicated, fast core on the host — e.g. in
-  `docker-compose.yml`:
-  ```yaml
-      cpus: "2.0"           # let it have real CPU
-      cpuset: "2,3"         # pin to specific cores, away from other containers
-  ```
-  and keep player counts and map sizes modest (q3dm7, q3tourney2 are lighter than
-  q3dm17). `server.cfg` ships `sv_fps 20` (stock, max headroom); only try 30 if
-  pings stay flat.
-
-### Client-side smoothness
-
-- **Resolution / render method:** lowering these in the in-game menu fixes low FPS
-  (as you found).
-- **Client netcode cvars** (console `~`, persist per browser):
-  ```
-  \rate 25000
-  \snaps 40
-  \cl_maxpackets 60
-  \cl_timenudge 0
-  ```
+Lowering resolution or the render method in the in-game video menu fixes low
+FPS on weaker client PCs.

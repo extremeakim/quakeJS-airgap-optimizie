@@ -1,0 +1,3 @@
+# Docker image exports: attach to a GitHub Release, never commit
+*.tar
+*.tar.gz

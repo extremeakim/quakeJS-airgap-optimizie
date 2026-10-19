@@ -1,0 +1,42 @@
+# QuakeJS — one shared server, everyone plays in a browser. Air-gap friendly:
+# all assets are baked into the image, nothing is fetched from the internet.
+#
+# The whole party shares ONE container: QuakeJS runs a real dedicated multiplayer
+# server inside this image, so every browser just connects to it.
+# Open http://<server-ip>:8080 on each PC.
+
+services:
+  quakejs:
+    image: quakejs-airgap:latest
+    container_name: quakejs
+
+    ports:
+      - "8080:80"               # web client  -> http://<server-ip>:8080
+      - "27960:27960"           # WebSocket game server (browser clients connect here)
+
+    volumes:
+      # Map / rules — edit ./server.cfg then `docker compose restart quakejs`.
+      # KEEP server.cfg next to this file; a bind mount of a missing file makes an
+      # empty one and the server loses its config. (Delete this line to just use
+      # the config baked into the image.)
+      - ./server.cfg:/quakejs/base/baseq3/server.cfg:ro
+
+    # Recover automatically. `unless-stopped` restarts on crash/exit AND on boot,
+    # but not after you manually `docker compose stop`. The image also runs an
+    # internal watchdog that turns a *hang* into an exit so this policy can fire.
+    restart: unless-stopped
+
+    # Give the (single-threaded) dedicated server real, ideally isolated CPU so it
+    # doesn't hitch and spike everyone's ping. Tune to your host:
+    cpus: "2.0"                 # up to 2 cores of CPU time
+    # cpuset: "2,3"             # OPTIONAL: pin to specific cores away from other
+                                # containers (uncomment + set to real core ids)
+
+    # The HEALTHCHECK is baked into the image; `docker ps` will show healthy/
+    # unhealthy. Uncomment to override the cadence here if you want:
+    # healthcheck:
+    #   test: ["CMD", "node", "/healthcheck.js"]
+    #   interval: 30s
+    #   timeout: 6s
+    #   start_period: 45s
+    #   retries: 3
